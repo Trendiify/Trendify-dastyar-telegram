@@ -369,7 +369,7 @@ async function resetGroupData(env, chatId) {
   await kvDelete(env, `badwords:${chatId}`);
   await kvDelete(env, `ad_config:${chatId}`);
   try {
-    for (const prefix of [`warn:${chatId}:`, `captcha:${chatId}:`]) {
+    for (const prefix of [`warn:${chatId}:`, `captcha:${chatId}:`, `muted:${chatId}:`]) {
       let cursor;
       do {
         const list = await env.KV.list({ prefix, cursor });
@@ -599,18 +599,48 @@ async function getWarn(env, chatId, userId) {
   }
 }
 
+async function recordMute(env, chatId, userId, name, secs) {
+  await kvPut(env, `muted:${chatId}:${userId}`, JSON.stringify({ name: name || "" }), { expirationTtl: Math.max(60, Math.floor(secs)) });
+}
+
+// اگر کاربر در تلگرام محدود (سکوت) است، محدودیت را برمی‌دارد؛ اگر برداشت true برمی‌گرداند
+async function liftMute(env, chatId, userId) {
+  await kvDelete(env, `muted:${chatId}:${userId}`);
+  const r = await tg(env, "getChatMember", { chat_id: chatId, user_id: userId });
+  if (r.ok && r.result && r.result.status === "restricted") {
+    const res = await restrictChatMember(env, chatId, userId, FULL_PERMS, 0);
+    return !!res.ok;
+  }
+  return false;
+}
+
+async function clearUserWarns(env, chatId, userId) {
+  await kvDelete(env, `warn:${chatId}:${userId}`);
+  return liftMute(env, chatId, userId);
+}
+
 async function getWarnList(env, gid) {
   if (!env.KV) return { entries: [], total: 0 };
-  const prefix = `warn:${gid}:`;
-  const names = await listAllKeys(env, prefix);
-  const entries = [];
-  for (const name of names.slice(0, 60)) {
-    const uid = name.slice(prefix.length);
+  const wPrefix = `warn:${gid}:`;
+  const mPrefix = `muted:${gid}:`;
+  const wNames = await listAllKeys(env, wPrefix);
+  const mNames = await listAllKeys(env, mPrefix);
+  /** @type {Record<string, {id: string, n: number, name: string, muted: boolean}>} */
+  const map = {};
+  for (const name of wNames.slice(0, 60)) {
+    const uid = name.slice(wPrefix.length);
     const w = await getWarn(env, gid, uid);
-    if (w.n > 0) entries.push({ id: uid, n: w.n, name: w.name });
+    if (w.n > 0) map[uid] = { id: uid, n: w.n, name: w.name, muted: false };
   }
-  entries.sort((a, b) => b.n - a.n);
-  return { entries, total: names.length };
+  for (const name of mNames.slice(0, 60)) {
+    const uid = name.slice(mPrefix.length);
+    let nm = "";
+    try { nm = JSON.parse((await kvGet(env, name)) || "{}").name || ""; } catch (e) { nm = ""; }
+    if (map[uid]) { map[uid].muted = true; if (!map[uid].name) map[uid].name = nm; }
+    else map[uid] = { id: uid, n: 0, name: nm, muted: true };
+  }
+  const entries = Object.values(map).sort((a, b) => b.n - a.n);
+  return { entries, total: entries.length };
 }
 
 function warnLabel(e) {
@@ -619,20 +649,20 @@ function warnLabel(e) {
 
 async function renderWarnList(env, gid) {
   const { entries, total } = await getWarnList(env, gid);
-  if (!entries.length) return { text: "✅ هیچ کاربری اخطار فعال ندارد.", entries };
-  const lines = entries.slice(0, 40).map((e) => `▫️ ${esc(warnLabel(e))} — <b>${e.n}</b> اخطار (<code>${e.id}</code>)`);
+  if (!entries.length) return { text: "✅ هیچ کاربری اخطار یا سکوت فعال ندارد.", entries };
+  const lines = entries.slice(0, 40).map((e) => `▫️ ${e.muted ? "🔇 " : ""}${esc(warnLabel(e))} — <b>${e.n}</b> اخطار (<code>${e.id}</code>)`);
   const more = total > entries.length ? `\n… و ${total - entries.length} مورد دیگر` : "";
   return {
-    text: `⚠️ <b>کاربران دارای اخطار (${entries.length}):</b>\n\n${lines.join("\n")}${more}\n\nحذف یک نفر: <code>حذف اخطار [آیدی]</code>\nحذف همه: <code>حذف همه اخطارها</code>`,
+    text: `⚠️ <b>کاربران دارای اخطار یا سکوت (${entries.length}):</b>\n\n${lines.join("\n")}${more}\n\n🔇 = در حال سکوت\nحذف یک نفر (و برداشتن سکوتش): <code>حذف اخطار [آیدی]</code>\nحذف همه: <code>حذف همه اخطارها</code>`,
     entries
   };
 }
 
 async function clearAllWarns(env, gid) {
   if (!env.KV) return 0;
-  const names = await listAllKeys(env, `warn:${gid}:`);
-  for (const n of names) await env.KV.delete(n);
-  return names.length;
+  const { entries } = await getWarnList(env, gid);
+  for (const e of entries) await clearUserWarns(env, gid, e.id);
+  return entries.length;
 }
 
 async function issueWarn(env, chatId, user, settings, reason) {
@@ -649,6 +679,7 @@ async function issueWarn(env, chatId, user, settings, reason) {
       return;
     }
     const act = settings.warn_action || "mute";
+    if (act === "mute") await recordMute(env, chatId, user.id, user.first_name, (settings.mute_hours || 24) * 3600);
     const phrase = act === "ban" ? "برای همیشه <b>مسدود</b> شد" : act === "kick" ? "<b>اخراج</b> شد" : `به مدت <b>${hoursLabel(settings.mute_hours || 24)}</b> <b>سکوت</b> شد`;
     await sendMessage(env, chatId, `🚫 کاربر ${who} به دلیل دریافت ${limit} اخطار (${esc(reason)}) ${phrase}!`);
   } else {
@@ -966,8 +997,8 @@ async function handleAdminCommands(env, c) {
   if ((rest = matchCmd(text, ["حذف اخطار", "صفر اخطار", "/resetwarn"])) !== null) {
     const t = resolveTarget(msg, textL);
     if (!t) { if (rest === "") await reply("⚠️ ریپلای کنید یا آیدی عددی بنویسید:\n<code>حذف اخطار 1868832604</code>"); return true; }
-    await kvDelete(env, `warn:${chatId}:${t.id}`);
-    await reply(`✅ اخطارهای ${t.html} صفر شد.`);
+    const lifted = await clearUserWarns(env, chatId, t.id);
+    await reply(`✅ اخطارهای ${t.html} صفر شد.${lifted ? "\n🔊 سکوت او هم برداشته شد." : ""}`);
     return true;
   }
 
@@ -1017,6 +1048,7 @@ async function handleAdminCommands(env, c) {
     } else if (key === "unban") {
       const r = await unbanChatMember(env, chatId, t.id);
       await kvDelete(env, `warn:${chatId}:${t.id}`);
+      await kvDelete(env, `muted:${chatId}:${t.id}`);
       await restrictChatMember(env, chatId, t.id, FULL_PERMS, 0);
       await reply(r.ok ? `✅ ${t.html} آزاد شد و اخطارهایش صفر گردید.` : "⚠️ انجام نشد؛ ربات باید ادمین باشد.");
     } else if (key === "ban") {
@@ -1027,11 +1059,13 @@ async function handleAdminCommands(env, c) {
       await reply(r.ok ? `👢 ${t.html} اخراج شد.` : "⚠️ انجام نشد؛ ربات باید ادمین با دسترسی مسدود کردن باشد.");
     } else if (key === "unmute") {
       const r = await restrictChatMember(env, chatId, t.id, FULL_PERMS, 0);
+      await kvDelete(env, `muted:${chatId}:${t.id}`);
       await reply(r.ok ? `🔊 سکوت ${t.html} برداشته شد.` : "⚠️ انجام نشد؛ ربات باید ادمین با دسترسی محدود کردن باشد.");
     } else if (key === "mute") {
       const s = await getSettings(env, chatId);
       const secs = parseDuration(textL) || s.mute_hours * 3600;
       const r = await restrictChatMember(env, chatId, t.id, NO_PERMS, Math.floor(Date.now() / 1000) + secs);
+      if (r.ok) await recordMute(env, chatId, t.id, t.name, secs);
       await reply(r.ok ? `🔇 ${t.html} به مدت <b>${humanDuration(secs)}</b> سکوت شد.` : "⚠️ انجام نشد؛ ربات باید ادمین با دسترسی محدود کردن باشد.");
     }
     return true;
@@ -1266,15 +1300,15 @@ async function renderMenu(env, scope, gid, menu, userId) {
 
     case "warned": {
       const wl = await renderWarnList(env, gid);
-      const rows = wl.entries.slice(0, 20).map((e) => [{ text: `🧹 ${warnLabel(e).slice(0, 20)} (${e.n})`, callback_data: D("x", "wr" + e.id) }]);
+      const rows = wl.entries.slice(0, 20).map((e) => [{ text: `${e.muted ? "🔇" : "🧹"} ${warnLabel(e).slice(0, 20)} (${e.n})`, callback_data: D("x", "wr" + e.id) }]);
       if (wl.entries.length) rows.push([{ text: "🗑 پاک کردن اخطار همه", callback_data: D("x", "wra") }]);
       rows.push(back);
-      return { text: wl.text + (wl.entries.length ? "\n\nبا لمس نام هر کاربر، اخطارهایش پاک می‌شود:" : ""), kb: kb(rows) };
+      return { text: wl.text + (wl.entries.length ? "\n\nبا لمس نام هر کاربر، اخطارهایش پاک و در صورت سکوت، سکوتش برداشته می‌شود:" : ""), kb: kb(rows) };
     }
 
     case "clearwarns":
       return {
-        text: "⚠️ <b>مطمئن هستید؟</b>\nاخطار همه کاربران این گروه پاک می‌شود.",
+        text: "⚠️ <b>مطمئن هستید؟</b>\nاخطار همه کاربران پاک و سکوت‌ها برداشته می‌شود.",
         kb: kb([[{ text: "✅ بله، پاک شود", callback_data: D("x", "wray") }, { text: "❌ انصراف", callback_data: D("m", "warned") }]])
       };
 
@@ -1444,8 +1478,8 @@ async function handleCallbackQuery(env, q) {
         break;
       }
       if (/^wr\d+$/.test(arg)) {
-        await kvDelete(env, `warn:${gid}:${arg.slice(2)}`);
-        toast = "✅ اخطارهای کاربر پاک شد";
+        const lifted = await clearUserWarns(env, gid, arg.slice(2));
+        toast = lifted ? "✅ اخطار پاک و سکوت برداشته شد" : "✅ اخطارهای کاربر پاک شد";
         menu = "warned";
         break;
       }
